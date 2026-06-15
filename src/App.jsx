@@ -4,7 +4,7 @@ import {
   Line,
   XAxis,
   YAxis,
-  Tooltip,
+  Tooltip as ChartTooltip,
   ResponsiveContainer,
   ReferenceDot,
   ReferenceLine,
@@ -1400,7 +1400,7 @@ function SingleCampaignTab({ rules, knownLabels, accountTz, localTz }) {
                     stroke="#d6d3d1"
                     tickFormatter={(v) => `$${v.toFixed(0)}`}
                   />
-                  <Tooltip
+                  <ChartTooltip
                     contentStyle={{
                       fontSize: 11,
                       borderRadius: 4,
