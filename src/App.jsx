@@ -1,15 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from "react";
-import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  Tooltip as ChartTooltip,
-  ResponsiveContainer,
-  ReferenceDot,
-  ReferenceLine,
-  CartesianGrid,
-} from "recharts";
+import React, { useState, useEffect, useMemo, useRef, useCallback, Suspense, lazy } from "react";
 import {
   FileText,
   Calculator as CalcIcon,
@@ -28,6 +17,9 @@ import {
   HelpCircle,
   BookOpen,
 } from "lucide-react";
+
+// Lazy-loaded so the heavy Recharts dependency stays out of the initial bundle.
+const BudgetChart = lazy(() => import("./BudgetChart.jsx"));
 
 /* ============================================================
  *  PARSER
@@ -175,29 +167,49 @@ const TIMEZONES = [
 
 const DEFAULT_TZ = "America/Los_Angeles";
 
-function getLocalTz() {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone;
-  } catch {
-    return "UTC";
+// Constructing an Intl.DateTimeFormat is expensive, and these helpers run
+// per-rule and per-ledger-row on every render. Cache one formatter per unique
+// option set so repeated calls only pay for formatToParts, not construction.
+const _dtfCache = new Map();
+function getDTF(options) {
+  const key = JSON.stringify(options);
+  let dtf = _dtfCache.get(key);
+  if (!dtf) {
+    dtf = new Intl.DateTimeFormat("en-US", options);
+    _dtfCache.set(key, dtf);
   }
+  return dtf;
+}
+
+// The local timezone can't change during a session — resolve it once.
+let _localTz;
+function getLocalTz() {
+  if (_localTz) return _localTz;
+  try {
+    _localTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  } catch {
+    _localTz = "UTC";
+  }
+  return _localTz;
 }
 
 function tzAbbrev(tz, date = new Date()) {
   try {
-    const parts = new Intl.DateTimeFormat("en-US", {
-      timeZone: tz,
-      timeZoneName: "short",
-    }).formatToParts(date);
+    const parts = getDTF({ timeZone: tz, timeZoneName: "short" }).formatToParts(date);
     return parts.find((p) => p.type === "timeZoneName")?.value || tz;
   } catch {
     return tz;
   }
 }
 
+// A zone's UTC offset only shifts at DST boundaries, so cache it per (zone, day).
+const _offsetCache = new Map();
 function tzOffsetMinutes(tz, date = new Date()) {
+  const dayKey = tz + "|" + Math.floor(date.getTime() / 86400000);
+  const cached = _offsetCache.get(dayKey);
+  if (cached !== undefined) return cached;
   try {
-    const dtf = new Intl.DateTimeFormat("en-US", {
+    const dtf = getDTF({
       timeZone: tz,
       year: "numeric",
       month: "2-digit",
@@ -217,7 +229,9 @@ function tzOffsetMinutes(tz, date = new Date()) {
       parseInt(parts.minute, 10),
       parseInt(parts.second, 10)
     );
-    return Math.round((asUTC - date.getTime()) / 60000);
+    const offset = Math.round((asUTC - date.getTime()) / 60000);
+    _offsetCache.set(dayKey, offset);
+    return offset;
   } catch {
     return 0;
   }
@@ -234,7 +248,7 @@ function convertHHMM(hhmm, fromTz, toTz, date = new Date()) {
 
 function nowInTz(tz, date = new Date()) {
   try {
-    const dtf = new Intl.DateTimeFormat("en-US", {
+    const dtf = getDTF({
       timeZone: tz,
       weekday: "short",
       hour: "2-digit",
@@ -315,6 +329,33 @@ function computeCurve(startBudget, applicable) {
   return steps;
 }
 
+// The budget pulled from a live report is the value *right now*, after the
+// rules that already fired today have changed it — not the 00:00 value. To
+// rebuild the day correctly we back out every rule whose time is at or before
+// `asOfHHMM`, recovering the true start-of-day budget. Uses each rule's actual
+// action percent (not the percentages written into rule names, which can drift).
+// Pass asOfHHMM = null to skip back-out and treat the input as start-of-day.
+function startOfDayFromCurrent(currentBudget, applicable, asOfHHMM) {
+  if (!asOfHHMM) return currentBudget;
+  let factor = 1;
+  for (const r of applicable) {
+    if (r.cadence.time <= asOfHHMM) {
+      const sign = r.action.type === "increase" ? 1 : -1;
+      factor *= 1 + (sign * r.action.percent) / 100;
+    }
+  }
+  return factor !== 0 ? currentBudget / factor : currentBudget;
+}
+
+// The day's "expected spend" is the budget right before the final rule fires —
+// the level the campaign actually runs at, before any end-of-day reset.
+function spendBeforeLastRule(steps, startBudget) {
+  // steps = [00:00 start, ...rule steps..., 23:59 end]; the last real rule is
+  // the second-to-last entry, and its `before` is the value just ahead of it.
+  if (steps.length < 3) return startBudget;
+  return steps[steps.length - 2].before;
+}
+
 function fmtMoney(n) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
   return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -344,6 +385,38 @@ const ACTIVE_ACCOUNT_KEY = "accounts:active";
 const LEGACY_RULES_KEY = "rules:all";
 const accountRulesKey = (id) => `account:${id}:rules`;
 
+// Persistence adapter: prefer the host-provided async `window.storage`
+// (sandbox/preview environments expose it); otherwise fall back to
+// localStorage so data survives reloads when the app is deployed standalone.
+// The `{ value }` return shape mirrors what the callers below already expect.
+const storage =
+  typeof window !== "undefined" && window.storage
+    ? window.storage
+    : {
+        async get(key) {
+          try {
+            const value = localStorage.getItem(key);
+            return value === null ? null : { value };
+          } catch {
+            return null;
+          }
+        },
+        async set(key, value) {
+          try {
+            localStorage.setItem(key, value);
+          } catch {
+            /* quota exceeded or storage unavailable — ignore */
+          }
+        },
+        async delete(key) {
+          try {
+            localStorage.removeItem(key);
+          } catch {
+            /* ignore */
+          }
+        },
+      };
+
 function newAccountId() {
   return "acc_" + Math.random().toString(36).slice(2, 10);
 }
@@ -355,7 +428,7 @@ function normalizeAccount(acc) {
 async function loadAccounts() {
   // Try current scheme
   try {
-    const res = await window.storage.get(ACCOUNTS_KEY);
+    const res = await storage.get(ACCOUNTS_KEY);
     if (res?.value) {
       const list = JSON.parse(res.value);
       if (Array.isArray(list) && list.length > 0) return list.map(normalizeAccount);
@@ -365,11 +438,11 @@ async function loadAccounts() {
   }
   // Migrate from legacy single-bucket storage if present
   try {
-    const legacy = await window.storage.get(LEGACY_RULES_KEY);
+    const legacy = await storage.get(LEGACY_RULES_KEY);
     if (legacy?.value) {
       const acc = normalizeAccount({ id: newAccountId(), name: "Account 1" });
-      await window.storage.set(accountRulesKey(acc.id), legacy.value);
-      await window.storage.set(ACCOUNTS_KEY, JSON.stringify([acc]));
+      await storage.set(accountRulesKey(acc.id), legacy.value);
+      await storage.set(ACCOUNTS_KEY, JSON.stringify([acc]));
       return [acc];
     }
   } catch {
@@ -377,13 +450,13 @@ async function loadAccounts() {
   }
   // Cold start
   const acc = normalizeAccount({ id: newAccountId(), name: "Account 1" });
-  await window.storage.set(ACCOUNTS_KEY, JSON.stringify([acc]));
+  await storage.set(ACCOUNTS_KEY, JSON.stringify([acc]));
   return [acc];
 }
 
 async function saveAccounts(accounts) {
   try {
-    await window.storage.set(ACCOUNTS_KEY, JSON.stringify(accounts));
+    await storage.set(ACCOUNTS_KEY, JSON.stringify(accounts));
   } catch (e) {
     console.error("Failed to save accounts", e);
   }
@@ -391,7 +464,7 @@ async function saveAccounts(accounts) {
 
 async function loadActiveAccountId() {
   try {
-    const res = await window.storage.get(ACTIVE_ACCOUNT_KEY);
+    const res = await storage.get(ACTIVE_ACCOUNT_KEY);
     if (res?.value) return res.value;
   } catch {
     // not found
@@ -401,7 +474,7 @@ async function loadActiveAccountId() {
 
 async function saveActiveAccountId(id) {
   try {
-    await window.storage.set(ACTIVE_ACCOUNT_KEY, id);
+    await storage.set(ACTIVE_ACCOUNT_KEY, id);
   } catch (e) {
     console.error("Failed to save active account", e);
   }
@@ -409,7 +482,7 @@ async function saveActiveAccountId(id) {
 
 async function loadRulesForAccount(id) {
   try {
-    const res = await window.storage.get(accountRulesKey(id));
+    const res = await storage.get(accountRulesKey(id));
     if (res?.value) return JSON.parse(res.value);
   } catch {
     // not found
@@ -419,7 +492,7 @@ async function loadRulesForAccount(id) {
 
 async function saveRulesForAccount(id, rules) {
   try {
-    await window.storage.set(accountRulesKey(id), JSON.stringify(rules));
+    await storage.set(accountRulesKey(id), JSON.stringify(rules));
   } catch (e) {
     console.error("Failed to save rules", e);
   }
@@ -427,7 +500,7 @@ async function saveRulesForAccount(id, rules) {
 
 async function deleteAccountRules(id) {
   try {
-    await window.storage.delete(accountRulesKey(id));
+    await storage.delete(accountRulesKey(id));
   } catch (e) {
     // best effort
   }
@@ -436,8 +509,6 @@ async function deleteAccountRules(id) {
 /* ============================================================
  *  UI
  * ============================================================ */
-
-const ACCENT = "#2563eb";
 
 function App() {
   const [tab, setTab] = useState("rules");
@@ -805,6 +876,11 @@ function RulesTab({ rules, setRules, accountTz, localTz, onTimezoneChange }) {
     }
   };
 
+  // Stable identity so memoized RuleRows don't re-render on every keystroke.
+  const toggleRow = useCallback((id) => {
+    setExpandedId((cur) => (cur === id ? null : id));
+  }, []);
+
   const filtered = useMemo(() => {
     return rules.filter((r) => {
       if (filter.locale !== "all" && r.locale !== filter.locale) return false;
@@ -1018,7 +1094,7 @@ function RulesTab({ rules, setRules, accountTz, localTz, onTimezoneChange }) {
                       key={r.id}
                       rule={r}
                       expanded={expandedId === r.id}
-                      onToggle={() => setExpandedId(expandedId === r.id ? null : r.id)}
+                      onToggle={toggleRow}
                       accountTz={accountTz}
                       localTz={localTz}
                       showLocal={!sameZone}
@@ -1046,7 +1122,7 @@ function Stat({ label, value, tooltip }) {
   );
 }
 
-function RuleRow({ rule, expanded, onToggle, accountTz, localTz, showLocal }) {
+const RuleRow = React.memo(function RuleRow({ rule, expanded, onToggle, accountTz, localTz, showLocal }) {
   const a = rule.action;
   const c = rule.cadence;
   const cadenceLabel = !c
@@ -1066,7 +1142,7 @@ function RuleRow({ rule, expanded, onToggle, accountTz, localTz, showLocal }) {
     <>
       <tr className="border-t border-stone-100 hover:bg-stone-50">
         <td className="px-3 py-2">
-          <button onClick={onToggle} className="text-stone-400 hover:text-stone-700">
+          <button onClick={() => onToggle(rule.id)} className="text-stone-400 hover:text-stone-700">
             {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           </button>
         </td>
@@ -1143,7 +1219,7 @@ function RuleRow({ rule, expanded, onToggle, accountTz, localTz, showLocal }) {
       )}
     </>
   );
-}
+});
 
 function LocaleBadge({ locale }) {
   const colors = {
@@ -1205,9 +1281,18 @@ function SingleCampaignTab({ rules, knownLabels, accountTz, localTz }) {
     [rules, selectedLabels, day]
   );
 
-  const startBudget = parseFloat(budget) || 0;
+  const currentBudget = parseFloat(budget) || 0;
+  // The entered budget is the live value as of now; for today, back out the
+  // rules that already fired to recover the true 00:00 start-of-day budget.
+  const isToday = day === acctNow.day;
+  const asOf = isToday ? acctNow.hhmm : null;
+  const startBudget = useMemo(
+    () => startOfDayFromCurrent(currentBudget, applicable, asOf),
+    [currentBudget, applicable, asOf]
+  );
   const steps = useMemo(() => computeCurve(startBudget, applicable), [startBudget, applicable]);
   const eod = steps[steps.length - 1].budget;
+  const expectedSpend = spendBeforeLastRule(steps, startBudget);
   const totalDelta = eod - startBudget;
   const totalPct = startBudget > 0 ? (totalDelta / startBudget) * 100 : 0;
 
@@ -1240,7 +1325,12 @@ function SingleCampaignTab({ rules, knownLabels, accountTz, localTz }) {
           />
         </div>
         <div className="md:col-span-3">
-          <label className="block text-xs font-medium text-stone-700 mb-1">Current budget</label>
+          <label className="block text-xs font-medium text-stone-700 mb-1 flex items-center gap-1">
+            <span>Current budget</span>
+            <InfoTip
+              content="The budget as it stands right now in Google Ads (e.g. straight from a report) — already changed by today's rules. The app backs those out to rebuild the rest of the day. When viewing a day other than today, this is treated as the start-of-day budget instead."
+            />
+          </label>
           <div className="relative">
             <span className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-400 text-sm">$</span>
             <input
@@ -1334,21 +1424,34 @@ function SingleCampaignTab({ rules, knownLabels, accountTz, localTz }) {
       ) : (
         <>
           {/* Summary stats */}
-          <section className="grid grid-cols-2 md:grid-cols-5 gap-3">
+          <section className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
             <Stat
               label="Start of day"
               value={`$${fmtMoney(startBudget)}`}
-              tooltip="Your input budget — the value at 00:00 in account time, before any of today's rules have fired."
+              tooltip={
+                isToday
+                  ? "Back-calculated 00:00 budget: your current budget with today's already-fired rules removed."
+                  : "The 00:00 budget for the selected day (your input is treated as start-of-day when not viewing today)."
+              }
             />
             <Stat
-              label={`Now (${acctNow.hhmm} ${accountAbbr})`}
+              label={isToday ? `Current (${acctNow.hhmm} ${accountAbbr})` : `At ${acctNow.hhmm} ${accountAbbr}`}
               value={`$${fmtMoney(nowBudget)}`}
-              tooltip="The budget after every rule with a time at or before the current account-time has fired today."
+              tooltip={
+                isToday
+                  ? "Your reported current budget — the live value the rest of the day is reconstructed around. For today it matches what you entered."
+                  : "The projected budget at the current clock time on the selected day, starting from your input as start-of-day."
+              }
+            />
+            <Stat
+              label="Expected spend"
+              value={`$${fmtMoney(expectedSpend)}`}
+              tooltip="The budget just before the final rule of the day fires — the level the campaign actually spends at, before any end-of-day reset. This is the 'EOD before the last rule' figure."
             />
             <Stat
               label="End of day"
               value={`$${fmtMoney(eod)}`}
-              tooltip="The budget after every rule for the selected day has fired. For US weekday campaigns the 23:45 rule resets the budget down by 65%, which is why EOD can be much lower than the daytime peak."
+              tooltip="The budget after every rule for the selected day has fired, including the end-of-day reset. This is the value the campaign starts the next day from — usually well below the expected-spend level."
             />
             <div className="bg-white border border-stone-200 rounded-lg px-4 py-3">
               <div className="text-[10px] uppercase tracking-wider text-stone-500 font-medium flex items-center gap-1">
@@ -1383,59 +1486,21 @@ function SingleCampaignTab({ rules, knownLabels, accountTz, localTz }) {
               </div>
             </div>
             <div style={{ width: "100%", height: 280 }}>
-              <ResponsiveContainer>
-                <LineChart data={chartData} margin={{ top: 10, right: 20, bottom: 5, left: 0 }}>
-                  <CartesianGrid strokeDasharray="2 4" stroke="#e7e5e4" />
-                  <XAxis
-                    dataKey="hour"
-                    type="number"
-                    domain={[0, 24]}
-                    ticks={[0, 3, 6, 9, 12, 15, 18, 21, 24]}
-                    tickFormatter={(h) => `${String(h).padStart(2, "0")}:00`}
-                    tick={{ fontSize: 10, fill: "#78716c" }}
-                    stroke="#d6d3d1"
-                  />
-                  <YAxis
-                    tick={{ fontSize: 10, fill: "#78716c" }}
-                    stroke="#d6d3d1"
-                    tickFormatter={(v) => `$${v.toFixed(0)}`}
-                  />
-                  <ChartTooltip
-                    contentStyle={{
-                      fontSize: 11,
-                      borderRadius: 4,
-                      border: "1px solid #d6d3d1",
-                      padding: "6px 8px",
-                    }}
-                    formatter={(v) => [`$${fmtMoney(v)}`, "Budget"]}
-                    labelFormatter={(h) => {
-                      const hh = Math.floor(h);
-                      const mm = Math.round((h - hh) * 60);
-                      return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")} ${accountAbbr}`;
-                    }}
-                  />
-                  <ReferenceLine
-                    x={nowHour}
-                    stroke="#dc2626"
-                    strokeWidth={1.5}
-                    strokeDasharray="3 3"
-                    label={{
-                      value: `Now ${acctNow.hhmm}`,
-                      position: "top",
-                      fill: "#dc2626",
-                      fontSize: 10,
-                    }}
-                  />
-                  <Line
-                    type="stepAfter"
-                    dataKey="budget"
-                    stroke={ACCENT}
-                    strokeWidth={2}
-                    dot={{ r: 3, fill: ACCENT, strokeWidth: 0 }}
-                    activeDot={{ r: 5 }}
-                  />
-                </LineChart>
-              </ResponsiveContainer>
+              <Suspense
+                fallback={
+                  <div className="w-full h-full flex items-center justify-center text-xs text-stone-400">
+                    Loading chart…
+                  </div>
+                }
+              >
+                <BudgetChart
+                  chartData={chartData}
+                  nowHour={nowHour}
+                  acctNow={acctNow}
+                  accountAbbr={accountAbbr}
+                  fmtMoney={fmtMoney}
+                />
+              </Suspense>
             </div>
           </section>
 
@@ -1680,31 +1745,40 @@ function BulkReportTab({ rules, accountTz, localTz }) {
   const rows = parseResult.rows;
   const detectedFormat = parseResult.format;
   const skipped = parseResult.skipped || 0;
+  const isToday = day === acctNow.day;
   const results = useMemo(() => {
+    // For today, each row's budget is the live value as of now, so back out the
+    // already-fired rules to recover its true start-of-day before projecting.
+    const asOf = isToday ? acctNow.hhmm : null;
     return rows.map((row) => {
       const applicable = rulesForDay(rules, row.labels, day);
-      const steps = computeCurve(row.budget, applicable);
+      const startBudget = startOfDayFromCurrent(row.budget, applicable, asOf);
+      const steps = computeCurve(startBudget, applicable);
       const eod = steps[steps.length - 1].budget;
+      const expectedSpend = spendBeforeLastRule(steps, startBudget);
       const nowBudget = budgetAtTime(steps, acctNow.hhmm);
       return {
         ...row,
+        startBudget,
         eod,
+        expectedSpend,
         nowBudget,
-        delta: eod - row.budget,
-        deltaPct: row.budget > 0 ? ((eod - row.budget) / row.budget) * 100 : 0,
+        delta: eod - startBudget,
+        deltaPct: startBudget > 0 ? ((eod - startBudget) / startBudget) * 100 : 0,
         rulesFired: applicable.length,
         steps,
       };
     });
-  }, [rows, rules, day, acctNow.hhmm]);
+  }, [rows, rules, day, acctNow.hhmm, isToday]);
 
   const exportCsv = () => {
-    const header = "name,current_budget,budget_now,eod_budget,delta,delta_pct,rules_fired";
+    const header =
+      "name,current_budget,start_of_day,expected_spend,eod_budget,net_delta,net_pct,rules_fired";
     const lines = results.map(
       (r) =>
-        `${r.name},${r.budget.toFixed(2)},${r.nowBudget.toFixed(2)},${r.eod.toFixed(
+        `${r.name},${r.budget.toFixed(2)},${r.startBudget.toFixed(2)},${r.expectedSpend.toFixed(
           2
-        )},${r.delta.toFixed(2)},${r.deltaPct.toFixed(2)},${r.rulesFired}`
+        )},${r.eod.toFixed(2)},${r.delta.toFixed(2)},${r.deltaPct.toFixed(2)},${r.rulesFired}`
     );
     const csv = [header, ...lines].join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
@@ -1717,7 +1791,8 @@ function BulkReportTab({ rules, accountTz, localTz }) {
   };
 
   const totalCurrent = results.reduce((sum, r) => sum + r.budget, 0);
-  const totalNow = results.reduce((sum, r) => sum + r.nowBudget, 0);
+  const totalStart = results.reduce((sum, r) => sum + r.startBudget, 0);
+  const totalSpend = results.reduce((sum, r) => sum + r.expectedSpend, 0);
   const totalEod = results.reduce((sum, r) => sum + r.eod, 0);
 
   return (
@@ -1821,22 +1896,32 @@ function BulkReportTab({ rules, accountTz, localTz }) {
         <>
           <section className="grid grid-cols-2 md:grid-cols-5 gap-3">
             <Stat label="Campaigns" value={results.length} />
-            <Stat label="Total current" value={`$${fmtMoney(totalCurrent)}`} />
             <Stat
-              label={`Total at ${acctNow.hhmm} ${accountAbbr}`}
-              value={`$${fmtMoney(totalNow)}`}
+              label={isToday ? `Total current (${acctNow.hhmm})` : "Total current"}
+              value={`$${fmtMoney(totalCurrent)}`}
+              tooltip="Sum of the budgets you entered — the live values right now."
             />
-            <Stat label="Total EOD" value={`$${fmtMoney(totalEod)}`} />
+            <Stat
+              label="Total expected spend"
+              value={`$${fmtMoney(totalSpend)}`}
+              tooltip="Sum of each campaign's budget just before its final rule fires — the level they actually spend at, before any end-of-day reset."
+            />
+            <Stat
+              label="Total EOD"
+              value={`$${fmtMoney(totalEod)}`}
+              tooltip="Sum of end-of-day budgets, after every rule including the reset has fired."
+            />
             <div className="bg-white border border-stone-200 rounded-lg px-4 py-3">
-              <div className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">
-                Net (EOD)
+              <div className="text-[10px] uppercase tracking-wider text-stone-500 font-medium flex items-center gap-1">
+                <span>Net (EOD)</span>
+                <InfoTip content="Total end-of-day budget minus total start-of-day budget — the net day-over-day change." />
               </div>
               <div
                 className={`text-lg num font-semibold mt-0.5 ${
-                  totalEod - totalCurrent >= 0 ? "text-emerald-700" : "text-rose-700"
+                  totalEod - totalStart >= 0 ? "text-emerald-700" : "text-rose-700"
                 }`}
               >
-                {totalEod - totalCurrent >= 0 ? "+" : ""}${fmtMoney(totalEod - totalCurrent)}
+                {totalEod - totalStart >= 0 ? "+" : ""}${fmtMoney(totalEod - totalStart)}
               </div>
             </div>
           </section>
@@ -1859,19 +1944,35 @@ function BulkReportTab({ rules, accountTz, localTz }) {
                 <thead className="bg-stone-50 text-stone-600 text-left">
                   <tr>
                     <th className="px-4 py-2 font-medium">Campaign</th>
-                    <th className="px-4 py-2 font-medium text-right">Current</th>
                     <th className="px-4 py-2 font-medium text-right">
                       <span className="inline-flex items-center gap-1 justify-end">
-                        At {acctNow.hhmm}
+                        Current
                         <InfoTip
-                          content="Budget at the current account-time on the selected day. Useful for spot-checking what the budget should be right now vs. what's actually set in Google Ads."
+                          content="The live budget you entered for this campaign — its value right now, after today's already-fired rules."
+                          side="left"
+                        />
+                      </span>
+                    </th>
+                    <th className="px-4 py-2 font-medium text-right">
+                      <span className="inline-flex items-center gap-1 justify-end">
+                        Start of day
+                        <InfoTip
+                          content="Back-calculated 00:00 budget — the current budget with today's already-fired rules removed."
+                          side="left"
+                        />
+                      </span>
+                    </th>
+                    <th className="px-4 py-2 font-medium text-right">
+                      <span className="inline-flex items-center gap-1 justify-end">
+                        Expected spend
+                        <InfoTip
+                          content="Budget just before the final rule fires — the level the campaign actually spends at, before any end-of-day reset."
                           side="left"
                         />
                       </span>
                     </th>
                     <th className="px-4 py-2 font-medium text-right">EOD</th>
-                    <th className="px-4 py-2 font-medium text-right">Δ EOD</th>
-                    <th className="px-4 py-2 font-medium text-right">Δ %</th>
+                    <th className="px-4 py-2 font-medium text-right">Net</th>
                     <th className="px-4 py-2 font-medium text-right">Rules</th>
                   </tr>
                 </thead>
@@ -1884,27 +1985,22 @@ function BulkReportTab({ rules, accountTz, localTz }) {
                           {r.labels.join(" · ")}
                         </div>
                       </td>
-                      <td className="px-4 py-2 text-right num text-stone-600">
+                      <td className="px-4 py-2 text-right num text-stone-800">
                         ${fmtMoney(r.budget)}
                       </td>
-                      <td className="px-4 py-2 text-right num text-stone-800">
-                        ${fmtMoney(r.nowBudget)}
+                      <td className="px-4 py-2 text-right num text-stone-500">
+                        ${fmtMoney(r.startBudget)}
                       </td>
-                      <td className="px-4 py-2 text-right num font-medium">${fmtMoney(r.eod)}</td>
+                      <td className="px-4 py-2 text-right num font-semibold text-stone-900">
+                        ${fmtMoney(r.expectedSpend)}
+                      </td>
+                      <td className="px-4 py-2 text-right num text-stone-600">${fmtMoney(r.eod)}</td>
                       <td
                         className={`px-4 py-2 text-right num ${
                           r.delta >= 0 ? "text-emerald-700" : "text-rose-700"
                         }`}
                       >
                         {r.delta >= 0 ? "+" : ""}${fmtMoney(r.delta)}
-                      </td>
-                      <td
-                        className={`px-4 py-2 text-right num ${
-                          r.deltaPct >= 0 ? "text-emerald-700" : "text-rose-700"
-                        }`}
-                      >
-                        {r.deltaPct >= 0 ? "+" : ""}
-                        {r.deltaPct.toFixed(2)}%
                       </td>
                       <td className="px-4 py-2 text-right num text-stone-500">{r.rulesFired}</td>
                     </tr>
@@ -2050,8 +2146,11 @@ function DocsTab() {
               <strong>Campaign name</strong> — optional, just for your reference.
             </li>
             <li>
-              <strong>Current budget</strong> — the daily budget set in Google Ads right now,
-              before today's rules fire.
+              <strong>Current budget</strong> — the budget as it stands <em>right now</em> in
+              Google Ads (e.g. straight from a report), already changed by whatever rules have
+              fired so far today. For today, the app backs those rules out to reconstruct the rest
+              of the day; when you pick a different day it's treated as that day's start-of-day
+              budget instead.
             </li>
             <li>
               <strong>Day</strong> — defaults to today (in account time). Pick another day to
@@ -2066,15 +2165,23 @@ function DocsTab() {
           <p>You get back:</p>
           <ul className="space-y-1.5 text-sm leading-relaxed list-disc pl-5">
             <li>
-              <strong>Start of day</strong> — your input budget at 00:00 in account time.
+              <strong>Start of day</strong> — the 00:00 budget, back-calculated by removing the
+              effect of every rule that already fired today. This is the base the whole day is
+              rebuilt from.
             </li>
             <li>
-              <strong>Now (HH:MM)</strong> — budget after all rules with time ≤ the current account
-              time have fired.
+              <strong>Current (HH:MM)</strong> — your reported budget; everything else is
+              reconstructed around it. For today it matches what you entered.
             </li>
             <li>
-              <strong>End of day</strong> — budget after every rule for the selected day has
-              fired.
+              <strong>Expected spend</strong> — the budget just before the final rule of the day
+              fires: the level the campaign actually spends at, before any end-of-day reset. This
+              is the "EOD before the last rule" figure.
+            </li>
+            <li>
+              <strong>End of day</strong> — budget after every rule for the selected day has fired,
+              including the reset. Usually well below the expected-spend level, and the value the
+              next day starts from.
             </li>
             <li>
               <strong>Budget curve</strong> — 24h stepped chart, with a red dashed line marking the
