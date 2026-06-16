@@ -1524,20 +1524,131 @@ US Mobile Test,100,CG YouTube US- MOB;CG YouTube - Shorts
 UK Mobile,90,CG YouTube UK- MOB
 Countries IOS,75,CG - YouTube Countries IOS Test;CG- Demand Gen- Cold Traffic- Countries`;
 
-function parseBulkInput(text) {
-  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
-  if (lines.length === 0) return [];
-  const header = lines[0].toLowerCase();
-  const start = header.includes("name") && header.includes("budget") ? 1 : 0;
-  const rows = [];
-  for (let i = start; i < lines.length; i++) {
-    const parts = lines[i].split(",").map((s) => s.trim());
-    if (parts.length < 3) continue;
-    const [name, budgetStr, labelsStr] = parts;
-    const labels = labelsStr.split(/[;|]/).map((s) => s.trim()).filter(Boolean);
-    rows.push({ name, budget: parseFloat(budgetStr) || 0, labels });
+// Standards-compliant CSV line parser: handles quoted fields, commas
+// inside quotes, and "" as an escaped quote.
+function parseCsvLine(line) {
+  const result = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"' && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else if (ch === '"') {
+        inQuotes = false;
+      } else {
+        current += ch;
+      }
+    } else {
+      if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === ",") {
+        result.push(current);
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
   }
-  return rows;
+  result.push(current);
+  return result.map((s) => s.trim());
+}
+
+function parseBulkInput(text) {
+  // Strip UTF-8 BOM if present (Excel/Google Ads exports often include one)
+  const cleaned = text.replace(/^\uFEFF/, "");
+  const lines = cleaned
+    .split(/\r?\n/)
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim());
+
+  if (lines.length === 0) return { rows: [], format: "empty" };
+
+  // Try to find a header row in the first 5 lines.
+  let headerIdx = -1;
+  let format = "unknown";
+  for (let i = 0; i < Math.min(lines.length, 5); i++) {
+    const lower = lines[i].toLowerCase();
+    if (
+      lower.includes("campaign status") &&
+      lower.includes("budget") &&
+      lower.includes("label")
+    ) {
+      headerIdx = i;
+      format = "google-ads";
+      break;
+    }
+    if (lower.includes("name") && lower.includes("budget")) {
+      headerIdx = i;
+      format = "simple";
+      break;
+    }
+  }
+
+  let nameIdx, budgetIdx, labelsIdx, startIdx;
+
+  if (headerIdx >= 0) {
+    const headerCells = parseCsvLine(lines[headerIdx]).map((h) => h.toLowerCase());
+    if (format === "google-ads") {
+      nameIdx = headerCells.indexOf("campaign");
+      budgetIdx = headerCells.indexOf("budget");
+      labelsIdx = headerCells.indexOf("label");
+    } else {
+      nameIdx = headerCells.findIndex((h) => h.includes("name"));
+      budgetIdx = headerCells.findIndex((h) => h.includes("budget"));
+      labelsIdx = headerCells.findIndex((h) => h.includes("label"));
+    }
+    startIdx = headerIdx + 1;
+  } else {
+    // No header detected — assume positional simple format
+    nameIdx = 0;
+    budgetIdx = 1;
+    labelsIdx = 2;
+    startIdx = 0;
+    format = "positional";
+  }
+
+  if (nameIdx < 0 || budgetIdx < 0 || labelsIdx < 0) {
+    return { rows: [], format };
+  }
+
+  const rows = [];
+  let skipped = 0;
+  for (let i = startIdx; i < lines.length; i++) {
+    const line = lines[i];
+    // Skip Google Ads total/subtotal rows
+    if (/^total:/i.test(line.trim())) continue;
+
+    const cells = parseCsvLine(line);
+    if (cells.length < Math.max(nameIdx, budgetIdx, labelsIdx) + 1) {
+      skipped++;
+      continue;
+    }
+
+    const name = cells[nameIdx];
+    if (!name || name === "--" || /^total:/i.test(name)) {
+      skipped++;
+      continue;
+    }
+
+    const budgetRaw = (cells[budgetIdx] || "").replace(/[^\d.\-]/g, "");
+    const budget = parseFloat(budgetRaw);
+    if (!Number.isFinite(budget) || budget <= 0) {
+      skipped++;
+      continue;
+    }
+
+    const labels = (cells[labelsIdx] || "")
+      .split(/[;|]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    rows.push({ name, budget, labels });
+  }
+
+  return { rows, format, skipped };
 }
 
 function BulkReportTab({ rules, accountTz, localTz }) {
@@ -1565,7 +1676,10 @@ function BulkReportTab({ rules, accountTz, localTz }) {
     e.target.value = ""; // allow re-uploading the same file
   };
 
-  const rows = useMemo(() => parseBulkInput(input), [input]);
+  const parseResult = useMemo(() => parseBulkInput(input), [input]);
+  const rows = parseResult.rows;
+  const detectedFormat = parseResult.format;
+  const skipped = parseResult.skipped || 0;
   const results = useMemo(() => {
     return rows.map((row) => {
       const applicable = rulesForDay(rules, row.labels, day);
@@ -1625,6 +1739,32 @@ function BulkReportTab({ rules, accountTz, localTz }) {
               <p className="text-xs text-emerald-700 mt-1 flex items-center gap-1">
                 <CheckCircle2 size={12} />
                 Loaded {uploadedName}
+              </p>
+            )}
+            {rows.length > 0 && (
+              <p className="text-[11px] text-stone-500 mt-1 flex items-center gap-1.5 flex-wrap">
+                <span>
+                  Detected{" "}
+                  <span className="text-stone-700 font-medium">
+                    {detectedFormat === "google-ads"
+                      ? "Google Ads campaign report"
+                      : detectedFormat === "simple"
+                      ? "simple CSV"
+                      : detectedFormat === "positional"
+                      ? "positional CSV (no header)"
+                      : "unknown format"}
+                  </span>
+                </span>
+                <span className="text-stone-300">·</span>
+                <span className="num">{rows.length}</span>
+                <span>campaign{rows.length === 1 ? "" : "s"} parsed</span>
+                {skipped > 0 && (
+                  <>
+                    <span className="text-stone-300">·</span>
+                    <span className="num text-stone-500">{skipped}</span>
+                    <span className="text-stone-500">row{skipped === 1 ? "" : "s"} skipped</span>
+                  </>
+                )}
               </p>
             )}
             {uploadError && (
@@ -1949,19 +2089,30 @@ function DocsTab() {
 
         <DocSection id="doc-bulk" title="Bulk Report">
           <p>
-            Run any number of campaigns through the same calculation in one go. Two ways to load
-            them:
+            Run any number of campaigns through the same calculation in one go. Three formats are
+            supported — the parser auto-detects which one you've given it:
           </p>
           <ul className="space-y-1.5 text-sm leading-relaxed list-disc pl-5">
             <li>
-              <strong>Upload CSV</strong> — pick a <span className="mono text-xs">.csv</span> file
-              from your computer.
+              <strong>Google Ads campaign report</strong> — the raw CSV export from Google Ads
+              (with the <span className="mono text-xs">Campaign report</span> title row and{" "}
+              <span className="mono text-xs">Total: ...</span> summary rows). Just upload it
+              as-is; the parser pulls the Campaign, Budget, and Label columns and skips the
+              metadata and totals.
             </li>
             <li>
-              <strong>Paste</strong> — drop CSV text directly into the textarea.
+              <strong>Simple CSV</strong> — three columns:{" "}
+              <span className="mono text-xs">name,current_budget,labels</span>.
+            </li>
+            <li>
+              <strong>Positional</strong> — same three columns but no header row.
             </li>
           </ul>
-          <p>Expected format:</p>
+          <p>
+            Two ways to load them: click <em>Upload CSV</em> to pick a file from your computer, or
+            paste CSV text directly into the textarea.
+          </p>
+          <p>Example simple format:</p>
           <pre className="mono text-[11px] bg-stone-100 text-stone-800 rounded p-3 overflow-x-auto scrollbar-thin border border-stone-200">
 {`name,current_budget,labels
 US Mobile Test,100,CG YouTube US- MOB;CG YouTube - Shorts
@@ -1971,12 +2122,13 @@ Countries IOS,75,CG - YouTube Countries IOS Test;CG- Demand Gen- Cold Traffic- C
           <p>
             Labels within a single campaign are separated by <span className="mono text-xs">;</span>{" "}
             or <span className="mono text-xs">|</span> because labels themselves often contain
-            commas.
+            commas. Google Ads exports always use <span className="mono text-xs">;</span>.
           </p>
           <p>
-            The output table shows current budget, budget at the current moment, EOD budget, the
-            delta from start to EOD, and how many rules matched. Click <em>Export CSV</em> to
-            download it.
+            Below the input area you'll see a small line confirming what format was detected and
+            how many campaigns were parsed. The output table shows current budget, budget at the
+            current moment, EOD budget, the delta from start to EOD, and how many rules matched.
+            Click <em>Export CSV</em> to download it.
           </p>
         </DocSection>
 
