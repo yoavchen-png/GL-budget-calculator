@@ -87,6 +87,7 @@ function parseRuleBlock(block) {
 
   let statusTargets = null; // e.g. "Enabled" or "Enabled, Paused"
   let labelsAny = [];
+  let labelsNone = []; // "Label contains none …" — campaigns with these are excluded
   let campaignType = null;
   let cadence = null;
   let owner = null;
@@ -97,6 +98,9 @@ function parseRuleBlock(block) {
     } else if (line.startsWith("Label contains any ")) {
       const labelStr = line.replace("Label contains any ", "");
       labelsAny = [...new Set(labelStr.split(",").map((s) => s.trim()).filter(Boolean))];
+    } else if (line.startsWith("Label contains none ")) {
+      const labelStr = line.replace("Label contains none ", "");
+      labelsNone = [...new Set(labelStr.split(",").map((s) => s.trim()).filter(Boolean))];
     } else if (line.startsWith("Campaign type:")) {
       campaignType = line.replace("Campaign type:", "").trim();
     } else if (!cadence) {
@@ -120,6 +124,7 @@ function parseRuleBlock(block) {
     action,
     statusTargets,
     labelsAny,
+    labelsNone,
     campaignType,
     cadence,
     owner,
@@ -292,7 +297,11 @@ function rulesForDay(rules, campaignLabels, dayIdx) {
       if (r.cadence.type === "once") return false;
       if (!r.cadence.days.includes(dayIdx)) return false;
       if (r.labelsAny.length === 0) return false; // no label rule = unsupported here
-      return r.labelsAny.some((l) => labelSet.has(l));
+      if (!r.labelsAny.some((l) => labelSet.has(l))) return false;
+      // "Label contains none …" — exclude the rule if the campaign carries any
+      // of the excluded labels.
+      if (r.labelsNone?.some((l) => labelSet.has(l))) return false;
+      return true;
     })
     .sort((a, b) => a.cadence.time.localeCompare(b.cadence.time));
 }
@@ -585,7 +594,10 @@ function App() {
 
   const knownLabels = useMemo(() => {
     const s = new Set();
-    rules.forEach((r) => r.labelsAny.forEach((l) => s.add(l)));
+    rules.forEach((r) => {
+      r.labelsAny.forEach((l) => s.add(l));
+      r.labelsNone?.forEach((l) => s.add(l));
+    });
     return [...s].sort();
   }, [rules]);
 
@@ -1192,11 +1204,20 @@ const RuleRow = React.memo(function RuleRow({ rule, expanded, onToggle, accountT
           <td></td>
           <td colSpan={expandedColspan} className="px-3 py-3">
             <div className="space-y-2">
-              <div className="flex flex-wrap gap-1">
+              <div className="flex flex-wrap gap-1 items-center">
+                <span className="text-[10px] text-stone-400 mr-0.5">Any of:</span>
                 {rule.labelsAny.map((l) => (
                   <LabelChip key={l} label={l} />
                 ))}
               </div>
+              {rule.labelsNone?.length > 0 && (
+                <div className="flex flex-wrap gap-1 items-center">
+                  <span className="text-[10px] text-stone-400 mr-0.5">Excludes:</span>
+                  {rule.labelsNone.map((l) => (
+                    <ExcludeChip key={l} label={l} />
+                  ))}
+                </div>
+              )}
               <div className="text-[11px] text-stone-600 space-y-0.5">
                 <div>
                   <span className="text-stone-400">Targets:</span> campaign status{" "}
@@ -1241,6 +1262,15 @@ function LabelChip({ label }) {
   return (
     <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] bg-stone-100 text-stone-700 rounded border border-stone-200">
       <Tag size={8} className="text-stone-400" />
+      {label}
+    </span>
+  );
+}
+
+function ExcludeChip({ label }) {
+  return (
+    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] bg-rose-50 text-rose-700 rounded border border-rose-200 line-through decoration-rose-300">
+      <Tag size={8} className="text-rose-400" />
       {label}
     </span>
   );
@@ -2113,9 +2143,13 @@ function DocsTab() {
           </p>
           <p>
             The parser extracts each rule's action percentage, target labels, cadence (daily or
-            weekly + which days), time, and status. Locale (US / UK / Countries) is inferred from the
-            rule's name prefix — but rule <em>matching</em> in calculations uses labels, not the
-            locale tag.
+            weekly + which days), time, and status. It reads both{" "}
+            <span className="mono text-xs">Label contains any</span> (the labels a campaign must
+            have for the rule to apply) and <span className="mono text-xs">Label contains none</span>{" "}
+            (labels that <em>exclude</em> a campaign from the rule). A rule fires only when the
+            campaign has at least one "any" label and none of the excluded ones. Locale (US / UK /
+            Countries) is inferred from the rule's name prefix — but rule <em>matching</em> in
+            calculations uses labels, not the locale tag.
           </p>
         </DocSection>
 
